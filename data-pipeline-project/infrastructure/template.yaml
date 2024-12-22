@@ -1,0 +1,172 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Data Pipeline Infrastructure for BLS and Population Data Analysis'
+
+Parameters:
+  # BLSApiKey:
+  #   Type: String
+  #   Description: API Key for BLS data access
+  #   NoEcho: true
+  
+  PopulationApiUrl:
+    Type: String
+    Description: URL for population data API
+    Default: 'https://api.example.com/population'
+
+Resources:
+  # SQS Queue for analysis triggers
+  AnalysisQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-analysis-queue'
+      VisibilityTimeout: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt AnalysisDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  # Dead Letter Queue
+  AnalysisDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-analysis-dlq'
+      MessageRetentionPeriod: 1209600
+
+  # S3 Bucket for data storage
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: SQSQueuePolicy
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-data-bucket'
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: 'population/'
+            Queue: !GetAtt AnalysisQueue.Arn
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # SQS Queue Policy
+  SQSQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref AnalysisQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3Notifications
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt AnalysisQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub arn:aws:s3:::${AWS::StackName}-data-bucket
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # Lambda Basic Execution Role
+  LambdaBasicRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # Lambda Resource Policy
+  LambdaResourcePolicy:
+    Type: AWS::IAM::Policy
+    DependsOn: DataBucket
+    Properties:
+      PolicyName: !Sub ${AWS::StackName}-lambda-resource-policy
+      Roles:
+        - !Ref LambdaBasicRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+            Resource:
+              - !Sub arn:aws:s3:::${AWS::StackName}-data-bucket
+              - !Sub arn:aws:s3:::${AWS::StackName}-data-bucket/*
+          - Effect: Allow
+            Action:
+              - sqs:SendMessage
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+            Resource:
+              - !GetAtt AnalysisQueue.Arn
+
+  # Lambda Function
+  DataPipelineLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaResourcePolicy
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-pipeline'
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaBasicRole.Arn
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Function placeholder'}
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref DataBucket
+          QUEUE_URL: !Ref AnalysisQueue
+          # BLS_API_KEY: !Ref BLSApiKey
+          POPULATION_API_URL: !Ref PopulationApiUrl
+
+  # EventBridge Rule
+  ScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Trigger data pipeline daily"
+      ScheduleExpression: "rate(1 day)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DataPipelineLambda.Arn
+          Id: "DataPipelineSchedule"
+
+  # Lambda Permission for EventBridge
+  ScheduledRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt DataPipelineLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledRule.Arn
+
+Outputs:
+  DataBucketName:
+    Description: "Name of the S3 bucket storing the data"
+    Value: !Ref DataBucket
+
+  AnalysisQueueUrl:
+    Description: "URL of the SQS queue for analysis triggers"
+    Value: !Ref AnalysisQueue
+
+  LambdaFunctionArn:
+    Description: "ARN of the Lambda function"
+    Value: !GetAtt DataPipelineLambda.Arn
